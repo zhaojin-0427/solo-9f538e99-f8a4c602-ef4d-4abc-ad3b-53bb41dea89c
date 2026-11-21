@@ -22,8 +22,8 @@ FastAPI 实例完成这件事，全程使用有理数精确运算（`fractions.F
 
 | 实例 | 端口 | 接口 | 职责 |
 |---|---|---|---|
-| package-builder | 8001 | `POST /build`，文档 `/docs` | 输入新旧区号及各自覆盖街块，输出 JSON 交接包 |
-| converter | 8002 | `POST /convert`，文档 `/docs` | 输入交接包与本次有数的旧区人数，输出新区人数 |
+| package-builder | 8001 | `POST /build`，`POST /analysis/build`，文档 `/docs` | 输入新旧区号及各自覆盖街块，输出 JSON 交接包或分析包 |
+| converter | 8002 | `POST /convert`，`POST /analysis/convert`，文档 `/docs` | 输入交接包/分析包与本次有数人数，输出新区人数或三项差额 |
 
 ### 交接包内容（不含任何街块编号或逐块归属）
 
@@ -75,6 +75,100 @@ FastAPI 实例完成这件事，全程使用有理数精确运算（`fractions.F
 }
 ```
 
+## 县界重划影响分析包（v2）
+
+年鉴需要把县界重划造成的人口增减单列。分析包在 v1 之上增加一组入口，
+原 `/build`、`/convert` 与 v1 包（`schema_version: 1`）保持不变。
+
+### 分析包入口（builder：`POST /analysis/build`）
+
+输入原有新旧区街块清单，外加改划前后各一组区号：
+
+- `before_districts`：**旧区**区号组，其街块取并集构成基期旧县界；
+- `after_districts`：**新区**区号组，其街块取并集构成报告期新县界。
+
+两组内部都**按街块去重**：同一街块被组内多个区覆盖只计一次，因此县界
+人数是街块人数的线性泛函，而不是各区人数的简单相加。组内重复区号也
+只计一次。区号组可写作 `["O1","O2"]`、`[{"code":"O1"},...]` 或
+`{"districts": [...]}`。
+
+返回的包（`schema_version: 2`）可离线复用，只含区号与精确有理系数，
+**不含任何街块编号或逐块归属**：
+
+```json
+{
+  "schema_version": 2,
+  "kind": "boundary_analysis",
+  "old_districts": ["O1", "O2"],
+  "new_districts": ["N1", "N2"],
+  "old_relations": [{"O1": 1, "O2": -1}],
+  "new_relations": [],
+  "old_boundary":            {"districts": ["O1"], "derivable": true, "coefficients": {"O1": "1"}},
+  "new_boundary_baseline":   {"districts": ["N1"], "derivable": true, "coefficients": {"O1": "1"}},
+  "new_boundary_report":     {"districts": ["N1"], "derivable": true, "coefficients": {"N1": "1"}},
+  "boundary_effect":         {"derivable": true, "coefficients": {"O2": "1"}}
+}
+```
+
+- `old_boundary` / `new_boundary_baseline`：基期旧县界、基期新县界人数，
+  都以**基期旧区人数**为变量（`A c = u`）；
+- `new_boundary_report`：报告期新县界人数，以**报告期新区人数**为变量
+  （`B d = u`）；
+- `boundary_effect`：直接存 `u_new − u_old` 的解，即使两个县界各自都
+  算不出，只要未报区号的系数相消，边界差额仍可精确推出。
+
+### 换算入口（converter：`POST /analysis/convert`）
+
+凭包接收两组已报人数（均为非负整数，缺省区号视为无资料）：
+
+- `old_populations`：基期已报的**旧区**人数；
+- `new_populations`：报告期已报的**新区**人数。
+
+也接受合并的 `populations`（按包内区号自动归入两期）。
+
+当次给出三项差额与分期分数算式：
+
+| 项目 | 定义 | 变量来源 |
+|---|---|---|
+| `total_change`（总变动） | 报告期新界 − 基期旧界 | 新区人数 − 旧区人数 |
+| `boundary_effect`（边界影响） | 基期新界 − 基期旧界 | 全部为旧区人数 |
+| `same_coverage_change`（同口径变化） | 报告期新界 − 基期新界 | 新区人数、基期新界 |
+
+响应要点：
+
+```json
+{
+  "total_change":          {"status": "computed", "difference": 3,
+                            "expression": "N1 - O1 - O2",
+                            "formula": "(N1) - (O1 + O2)", "...": "..."},
+  "boundary_effect":       {"status": "computed", "difference": -2, "...": "..."},
+  "same_coverage_change":  {"status": "missing", "difference": null,
+                            "missing_reason": "insufficient_known_new_districts"},
+  "differences": {"total_change": 3, "boundary_effect": -2,
+                  "same_coverage_change": null},
+  "formulas": {"total_change": {"expression": "...", "formula": "..."}, "...": "..."},
+  "missing": [{"code": "same_coverage_change", "missing_reason": "..."}],
+  "baseline": {"old_boundary": {...}, "new_boundary": {...}},
+  "report": {"new_boundary": {...}},
+  "checked_relations": [ /* 两期可检验的覆盖等式 */ ],
+  "same_scope_change": "...", "like_for_like_change": "..."
+}
+```
+
+规则：
+
+- **三项各自独立判定**：任一项可由本次数据精确推出就给出，其余标为缺资料；
+- 两个县界的基期人数分别算不出时，`boundary_effect` 仍可凭包内直接
+  差额关系给出；
+- 差额可正可负；
+- **整次报错**（HTTP 400，只返回错误体）的情形：
+  - 任一期**可检验**的覆盖等式出现矛盾（涉及未报区号的等式自动跳过）；
+  - 任何可算差额不是整数；
+- 边界分量本身是分数不算错误：只要相减后的三项差额为整数即可；
+- 缺资料原因：`not_expressible_from_old_districts`、
+  `not_expressible_from_new_districts`、`insufficient_known_old_districts`、
+  `insufficient_known_new_districts`。
+
 ## Docker Compose 启动
 
 ```bash
@@ -103,17 +197,29 @@ pytest -q
    当期已有旧区人数（非负整数），当次得到可精确推出的新区人数、
    带分数系数的算式，以及缺资料新区列表。
 
+县界重划影响分析：
+
+1. 在 `http://localhost:8001/docs` 的 `POST /analysis/build` 提交新旧区
+   街块清单、基期旧界区号组与报告期新界区号组，保存分析包 JSON；
+2. 在 `http://localhost:8002/docs` 的 `POST /analysis/convert` 提交该分析包、
+   基期旧区人数与报告期新区人数（均为非负整数），当次得到总变动、
+   边界影响、同口径变化三项差额及算式。
+
 ## 目录结构
 
 ```
 app/
-  rationals.py      # 精确有理线性代数（RREF、零空间、线性方程组）
-  expressions.py    # 分数与算式格式化
-  models.py         # Pydantic 请求/响应模型与校验
-  engine.py         # 交接包生成与换算的纯领域逻辑
-  builder_app.py    # 实例 1：/build
-  converter_app.py  # 实例 2：/convert
-tests/              # 14 个端到端测试（TestClient）
+  rationals.py       # 精确有理线性代数（RREF、零空间、线性方程组）
+  expressions.py     # 分数与算式格式化
+  models.py          # Pydantic 请求/响应模型与校验（v1）
+  engine.py          # 交接包生成与换算的纯领域逻辑（v1）
+  analysis.py        # 县界重划分析包与分析逻辑（v2）
+  analysis_models.py # 分析包请求/响应模型（v2）
+  builder_app.py     # 实例 1：/build、/analysis/build
+  converter_app.py   # 实例 2：/convert、/analysis/convert
+tests/
+  test_service.py    # v1：14 个端到端测试（TestClient）
+  test_analysis.py    # v2：县界重划分析端到端测试
 Dockerfile
 docker-compose.yml
 ```
